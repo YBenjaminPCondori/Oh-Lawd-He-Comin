@@ -1,0 +1,78 @@
+name: Deploy
+
+# Manual only. A deploy restarts the box that serves the demo, so it is a deliberate act and
+# never a side effect of a push. It needs three repository secrets to do anything:
+#   DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY   (optional: DEPLOY_PATH, DEPLOY_UNIT)
+# Without them the job says so and stops, instead of failing on every run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or SHA to deploy
+        required: false
+        default: main
+      restart:
+        description: Restart the service after syncing
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: rsync to the demo box and restart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Check the secrets are configured
+        id: gate
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          if [ -z "$HOST" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::DEPLOY_HOST is unset, so there is nowhere to deploy. Add DEPLOY_HOST, DEPLOY_USER and DEPLOY_SSH_KEY to enable this workflow."
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install the deploy key
+        if: steps.gate.outputs.configured == 'true'
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$KEY" > "$HOME/.ssh/deploy_key"
+          chmod 600 "$HOME/.ssh/deploy_key"
+          ssh-keyscan -H "$HOST" >> "$HOME/.ssh/known_hosts"
+
+      - name: Sync the repository
+        if: steps.gate.outputs.configured == 'true'
+        env:
+          SRV: ${{ secrets.DEPLOY_HOST }}
+          USR: ${{ secrets.DEPLOY_USER }}
+          BOX_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          target=ci-deploy/Oh-Lawd-He-Comin
+          if [ -n "$BOX_PATH" ]; then target="$BOX_PATH"; fi
+          rsync -az --delete --exclude .git --exclude .venv --exclude __pycache__ --exclude results --exclude runs -e "ssh -i $HOME/.ssh/deploy_key" ./ "$USR@$SRV:$target/"
+
+      - name: Install dependencies and restart
+        if: steps.gate.outputs.configured == 'true' && inputs.restart
+        env:
+          SRV: ${{ secrets.DEPLOY_HOST }}
+          USR: ${{ secrets.DEPLOY_USER }}
+          BOX_PATH: ${{ secrets.DEPLOY_PATH }}
+          UNIT: ${{ secrets.DEPLOY_UNIT }}
+        run: |
+          target=ci-deploy/Oh-Lawd-He-Comin
+          if [ -n "$BOX_PATH" ]; then target="$BOX_PATH"; fi
+          unit=chonkvid-main.service
+          if [ -n "$UNIT" ]; then unit="$UNIT"; fi
+          ssh -i "$HOME/.ssh/deploy_key" "$USR@$SRV" "cd $target/chonkvid && (test -d .venv || python3 -m venv .venv) && .venv/bin/pip install -q -r requirements.txt && export XDG_RUNTIME_DIR=/run/user/\$(id -u) && systemctl --user restart $unit && sleep 4 && systemctl --user is-active $unit"

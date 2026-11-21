@@ -1,0 +1,174 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CHONKVID_MODE: mock
+
+jobs:
+  tests:
+    name: pytest (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is out on purpose: mistralai-agents (the Managed Agent SDK) requires >=3.12,
+        # so requirements.txt cannot install there at all
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: chonkvid/requirements.txt
+      - name: Install
+        working-directory: chonkvid
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Compile every module
+        working-directory: chonkvid
+        run: python -m compileall -q chonkvid
+      - name: Test
+        working-directory: chonkvid
+        run: python -m pytest -q --durations=10
+
+  detector-control:
+    name: detector control (false positives must stay at zero)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: chonkvid/requirements.txt
+      - working-directory: chonkvid
+        run: pip install -r requirements.txt
+      - name: The control arm and the mention-is-not-infection case
+        working-directory: chonkvid
+        run: python -m pytest -q tests/test_chonkvid.py -k "detector or mention or control or thresh" -v
+
+  web:
+    name: front-end files parse
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: node --check on every hand-written script
+        run: |
+          fail=0
+          for f in chonkvid/web/*.js chonkvid/web/world/*.js; do
+            case "$f" in */vendor/*) continue;; esac
+            echo "checking $f"
+            node --check "$f" || fail=1
+          done
+          exit $fail
+      - name: Every script the pages reference exists
+        run: |
+          python3 - <<'PY'
+          import re, pathlib, sys
+          base = pathlib.Path("chonkvid/web")
+          missing = []
+          for page in base.rglob("*.html"):
+              html = page.read_text()
+              for src in re.findall(r'src="(/static/[^"]+)"', html):
+                  src = src.split("?")[0].split("#")[0]   # strip ?v=8 cache-busters
+                  target = base / src[len("/static/"):]
+                  if not target.exists():
+                      missing.append(f"{page}: {src}")
+          print("\n".join(missing) or "all referenced scripts exist")
+          sys.exit(1 if missing else 0)
+          PY
+
+  smoke:
+    name: server boots and answers (mock, no API key)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: chonkvid/requirements.txt
+      - working-directory: chonkvid
+        run: pip install -r requirements.txt
+      - name: Boot in mock mode and probe the real endpoints
+        working-directory: chonkvid
+        env:
+          CHONKVID_MODE: mock
+          CHONKVID_RESULTS_DIR: ${{ runner.temp }}/results
+          CHONKVID_RUNS_DIR: ${{ runner.temp }}/runs
+        run: |
+          set -euo pipefail
+          mkdir -p "$CHONKVID_RESULTS_DIR" "$CHONKVID_RUNS_DIR"
+          python -m chonkvid serve --host 127.0.0.1 --port 8000 >server.log 2>&1 &
+          srv=$!
+          trap 'kill $srv 2>/dev/null || true' EXIT
+          for i in $(seq 1 40); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/api/status || true)
+            [ "$code" = "200" ] && break
+            sleep 1
+          done
+          test "$code" = "200" || { echo "server never became healthy"; cat server.log; exit 1; }
+          for path in / /world /api/status /api/runs /static/world/sound.js /static/world/world.js /static/measured-run.json; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8000$path")
+            echo "$path -> $code"
+            test "$code" = "200"
+          done
+          curl -s http://127.0.0.1:8000/api/status | python3 -c "import json,sys; d=json.load(sys.stdin); print('mode:', d.get('mode'), 'models:', d.get('models')); assert d.get('mode') == 'mock'"
+          python3 -c "import json; d=json.load(open('web/measured-run.json')); print('measured run:', d['n_agents'], 'agents,', d['infected_total'], 'infected'); assert d['source'] == 'live'"
+          echo "server log tail:"; tail -5 server.log
+
+  docker:
+    name: container builds from a clean clone
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker build
+        working-directory: chonkvid
+        run: docker build -t chonkvid:ci .
+
+  mcp:
+    name: MCP server answers a tool list
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: chonkvid/requirements.txt
+      - working-directory: chonkvid
+        run: pip install -r requirements.txt
+      - name: Speak the MCP handshake over stdio
+        working-directory: chonkvid
+        run: |
+          python3 - <<'PY'
+          import json, subprocess, sys
+          init = {"jsonrpc":"2.0","id":1,"method":"initialize",
+                  "params":{"protocolVersion":"2024-11-05","capabilities":{},
+                            "clientInfo":{"name":"ci","version":"1"}}}
+          p = subprocess.run([sys.executable, "-m", "chonkvid", "mcp"],
+                             input=json.dumps(init) + "\n",
+                             capture_output=True, text=True, timeout=60)
+          print("stdout:", p.stdout[:400])
+          print("stderr:", p.stderr[-400:])
+          assert p.returncode == 0, f"mcp server exited {p.returncode}"
+          assert "serverInfo" in p.stdout or "protocolVersion" in p.stdout, "no handshake reply"
+          print("MCP handshake OK")
+          PY

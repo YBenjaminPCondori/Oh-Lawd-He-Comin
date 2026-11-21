@@ -7,8 +7,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY chonkvid/ ./chonkvid/
 COPY web/ ./web/
-COPY results/ ./results/
-COPY runs/ ./runs/
+# results/ and runs/ are gitignored, so a clean clone has neither: create them instead of
+# COPYing them, otherwise the image cannot be built from the repository at all
+RUN mkdir -p results runs
 
 ENV PYTHONUNBUFFERED=1
 ENV CHONKVID_MODE=auto
